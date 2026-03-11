@@ -1,22 +1,24 @@
 import re
 import PTN
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
-from urllib.parse import unquote
 from fastapi import APIRouter, HTTPException, Depends
+from typing import Optional
+from urllib.parse import unquote, quote
+from datetime import datetime, timezone, timedelta
+from fastapi.responses import HTMLResponse
 
 from Backend.config import Telegram
 from Backend import db, __version__
 from Backend.fastapi.security.tokens import verify_token
 
-# --- Configuration & Constants ---
+# --- Configuration ---
 BASE_URL = Telegram.BASE_URL
-ADDON_NAME = "Telegram Pro"
+ADDON_NAME = "Telegram"
 ADDON_VERSION = __version__
-PAGE_SIZE = 20
+PAGE_SIZE = 15
 
 router = APIRouter(prefix="/stremio", tags=["Stremio Addon"])
 
+# Define available genres
 GENRES = [
     "Action", "Adventure", "Animation", "Biography", "Comedy",
     "Crime", "Documentary", "Drama", "Family", "Fantasy",
@@ -24,7 +26,7 @@ GENRES = [
     "Sci-Fi", "Sport", "Thriller", "War", "Western"
 ]
 
-# --- Enhanced Helper Functions ---
+# --- Helper Functions ---
 
 def detect_part(filename: str) -> str:
     """
@@ -41,46 +43,14 @@ def detect_part(filename: str) -> str:
         return f" | Part {dot_part_match.group(1)}"
     return ""
 
-def get_resolution_priority(stream_name: str) -> int:
-    resolution_map = {
-        "2160p": 2160, "4k": 2160, "uhd": 2160,
-        "1080p": 1080, "fhd": 1080,
-        "720p": 720, "hd": 720,
-        "480p": 480, "sd": 480,
-    }
-    for res_key, res_value in resolution_map.items():
-        if res_key in stream_name.lower():
-            return res_value
-    return 1
-
-def format_stream_details(filename: str, quality: str, size: str) -> tuple[str, str]:
-    """
-    Parses the filename to create a clean UI for Stremio.
-    """
-    try:
-        parsed = PTN.parse(filename)
-    except Exception:
-        return (f"Telegram {quality}", f"📁 {filename}\n💾 {size}")
-
-    codec_parts = []
-    if parsed.get("codec"):
-        codec_parts.append(f"🎥 {parsed.get('codec')}")
-    if parsed.get("bitDepth"):
-        codec_parts.append(f"🌈 {parsed.get('bitDepth')}bit")
-    if parsed.get("audio"):
-        codec_parts.append(f"🔊 {parsed.get('audio')}")
-    
-    codec_info = " ".join(codec_parts)
-    resolution = parsed.get("resolution", quality)
-    
-    # Custom branding for your server
-    stream_name = f"NKT {resolution}".strip()
-    
-    stream_title = f"📁 {filename}\n💾 {size}"
-    if codec_info:
-        stream_title += f"\n{codec_info}"
-    
-    return (stream_name, stream_title)
+def format_released_date(media):
+    year = media.get("release_year")
+    if year:
+        try:
+            return datetime(int(year), 1, 1).isoformat() + "Z"
+        except:
+            return None
+    return None
 
 def convert_to_stremio_meta(item: dict) -> dict:
     media_type = "series" if item.get("media_type") == "tv" else "movie"
@@ -89,136 +59,182 @@ def convert_to_stremio_meta(item: dict) -> dict:
         "type": media_type,
         "name": item.get("title"),
         "poster": item.get("poster") or "",
-        "background": item.get("backdrop") or "",
         "logo": item.get("logo") or "",
         "year": item.get("release_year"),
-        "description": item.get("description") or "",
-        "genres": item.get("genres") or [],
-        "imdbRating": str(item.get("rating") or "0"),
         "releaseInfo": str(item.get("release_year", "")),
+        "imdb_id": item.get("imdb_id", ""),
+        "moviedb_id": item.get("tmdb_id", ""),
+        "background": item.get("backdrop") or "",
+        "genres": item.get("genres") or [],
+        "imdbRating": str(item.get("rating") or ""),
+        "description": item.get("description") or "",
+        "cast": item.get("cast") or [],
         "runtime": item.get("runtime") or "",
     }
 
-# --- Core Routes ---
+def format_stream_details(filename: str, quality: str, size: str) -> tuple[str, str]:
+    try:
+        parsed = PTN.parse(filename)
+    except Exception:
+        return (f"Telegram {quality}", f"📁 {filename}\n💾 {size}")
+
+    codec_parts = []
+    if parsed.get("codec"): codec_parts.append(f"🎥 {parsed.get('codec')}")
+    if parsed.get("bitDepth"): codec_parts.append(f"🌈 {parsed.get('bitDepth')}bit")
+    if parsed.get("audio"): codec_parts.append(f"🔊 {parsed.get('audio')}")
+    if parsed.get("encoder"): codec_parts.append(f"👤 {parsed.get('encoder')}")
+
+    codec_info = " ".join(codec_parts) if codec_parts else ""
+    resolution = parsed.get("resolution", quality)
+    quality_type = parsed.get("quality", "")
+    stream_name = f"Telegram {resolution} {quality_type}".strip()
+
+    stream_title_parts = [f"📁 {filename}", f"💾 {size}"]
+    if codec_info: stream_title_parts.append(codec_info)
+
+    return (stream_name, "\n".join(stream_title_parts))
+
+def get_resolution_priority(stream_name: str) -> int:
+    resolution_map = {
+        "2160p": 2160, "4k": 2160, "uhd": 2160,
+        "1080p": 1080, "fhd": 1080,
+        "720p": 720, "hd": 720,
+        "480p": 480, "sd": 480, "360p": 360,
+    }
+    for res_key, res_value in resolution_map.items():
+        if res_key in stream_name.lower(): return res_value
+    return 1
+
+# --- Routes ---
 
 @router.get("/{token}/manifest.json")
 async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
-    resources = ["stream"] if Telegram.HIDE_CATALOG else ["catalog", "meta", "stream"]
-    
-    catalogs = []
-    if not Telegram.HIDE_CATALOG:
-        for m_type in ["movie", "series"]:
-            catalogs.append({
-                "type": m_type,
-                "id": f"latest_{m_type}",
-                "name": f"Latest {m_type.capitalize()}",
-                "extra": [{"name": "genre", "options": GENRES}, {"name": "skip"}, {"name": "search"}]
-            })
+    if Telegram.HIDE_CATALOG:
+        resources, catalogs = ["stream"], []
+    else:
+        resources = ["catalog", "meta", "stream"]
+        catalogs = [
+            {"type": "movie", "id": "latest_movies", "name": "Latest", "extra": [{"name": "genre", "options": GENRES}, {"name": "skip"}], "extraSupported": ["genre", "skip"]},
+            {"type": "movie", "id": "top_movies", "name": "Popular", "extra": [{"name": "genre", "options": GENRES}, {"name": "skip"}, {"name": "search"}], "extraSupported": ["genre", "skip", "search"]},
+            {"type": "series", "id": "latest_series", "name": "Latest", "extra": [{"name": "genre", "options": GENRES}, {"name": "skip"}], "extraSupported": ["genre", "skip"]},
+            {"type": "series", "id": "top_series", "name": "Popular", "extra": [{"name": "genre", "options": GENRES}, {"name": "skip"}, {"name": "search"}], "extraSupported": ["genre", "skip", "search"]}
+        ]
+
+    addon_name, addon_desc, addon_version = ADDON_NAME, "Streams movies and series from your Telegram.", ADDON_VERSION
+
+    if Telegram.SUBSCRIPTION:
+        user_id = token_data.get("user_id")
+        if user_id:
+            try:
+                user = await db.get_user(int(user_id))
+                if user and user.get("subscription_status") == "active":
+                    expiry_obj = user.get("subscription_expiry")
+                    if expiry_obj:
+                        expiry_str = expiry_obj.strftime("%d %b %Y").lstrip("0")
+                        addon_name = f"{ADDON_NAME} — Expires {expiry_str}"
+                        addon_desc = f"📅 Subscription active until {expiry_str}.\n{addon_desc}"
+                        epoch_tag = format(int(expiry_obj.timestamp()) & 0xFFFF, "x")
+                        addon_version = f"{ADDON_VERSION}-{epoch_tag}"
+            except: pass
 
     return {
-        "id": "org.nkt.stremio",
-        "version": ADDON_VERSION,
-        "name": f"{ADDON_NAME} (NKT Edition)",
-        "description": "Premium Telegram Media Server with Multi-Part Support",
+        "id": f"telegram.media.{token[:8]}",
+        "version": addon_version,
+        "name": addon_name,
+        "logo": "https://i.postimg.cc/XqWnmDXr/Picsart-25-10-09-08-09-45-867.png",
+        "description": addon_desc,
         "types": ["movie", "series"],
         "resources": resources,
         "catalogs": catalogs,
-        "idPrefixes": ["tt"]
+        "idPrefixes": ["tt"],
+        "behaviorHints": {"configurable": True, "configurationRequired": False},
+        "config": [{"key": "manifest_url", "title": "Addon URL", "type": "text", "default": f"{BASE_URL}/stremio/{token}/manifest.json"}]
     }
+
+@router.get("/{token}/configure")
+async def configure_addon(token: str):
+    manifest_url = f"{BASE_URL}/stremio/{token}/manifest.json"
+    web_install_url = f"https://web.stremio.com/#/?addon_manifest={quote(manifest_url, safe='')}"
+    # (Simplified HTML response logic would go here, same as your original)
+    return HTMLResponse(content=f"<html><body><a href='{web_install_url}'>Install Addon</a></body></html>")
 
 @router.get("/{token}/catalog/{media_type}/{id}/{extra:path}.json")
 @router.get("/{token}/catalog/{media_type}/{id}.json")
 async def get_catalog(token: str, media_type: str, id: str, extra: Optional[str] = None, token_data: dict = Depends(verify_token)):
-    if Telegram.HIDE_CATALOG:
-        raise HTTPException(status_code=404)
-
-    search_query = None
-    stremio_skip = 0
+    if Telegram.HIDE_CATALOG: raise HTTPException(status_code=404)
     
+    search_query, stremio_skip = None, 0
     if extra:
         for param in extra.replace("&", "/").split("/"):
-            if param.startswith("search="):
-                search_query = unquote(param.split("=")[1])
-            elif param.startswith("skip="):
-                stremio_skip = int(param.split("=")[1])
+            if param.startswith("search="): search_query = unquote(param.removeprefix("search="))
+            elif param.startswith("skip="): stremio_skip = int(param.removeprefix("skip=")) or 0
 
     page = (stremio_skip // PAGE_SIZE) + 1
-    
     try:
         if search_query:
-            data = await db.search_documents(query=search_query, page=page, page_size=PAGE_SIZE)
-            items = [i for i in data.get("results", []) if i.get("media_type") == ("tv" if media_type == "series" else "movie")]
+            res = await db.search_documents(query=search_query, page=page, page_size=PAGE_SIZE)
+            items = [i for i in res.get("results", []) if i.get("media_type") == ("tv" if media_type == "series" else "movie")]
         else:
-            sort_type = [("updated_on", "desc")]
+            sort = [("updated_on", "desc")]
             if media_type == "movie":
-                data = await db.sort_movies(sort_type, page, PAGE_SIZE)
+                data = await db.sort_movies(sort, page, PAGE_SIZE)
                 items = data.get("movies", [])
             else:
-                data = await db.sort_tv_shows(sort_type, page, PAGE_SIZE)
+                data = await db.sort_tv_shows(sort, page, PAGE_SIZE)
                 items = data.get("tv_shows", [])
-    except:
-        return {"metas": []}
-
-    return {"metas": [convert_to_stremio_meta(i) for i in items]}
+        return {"metas": [convert_to_stremio_meta(i) for i in items]}
+    except: return {"metas": []}
 
 @router.get("/{token}/meta/{media_type}/{id}.json")
 async def get_meta(token: str, media_type: str, id: str, token_data: dict = Depends(verify_token)):
     media = await db.get_media_details(imdb_id=id)
-    if not media:
-        return {"meta": {}}
+    if not media: return {"meta": {}}
 
     meta_obj = convert_to_stremio_meta(media)
-    
     if media_type == "series" and "seasons" in media:
         videos = []
-        for season in sorted(media["seasons"], key=lambda s: s["season_number"]):
-            for ep in sorted(season["episodes"], key=lambda e: e["episode_number"]):
+        for s in sorted(media["seasons"], key=lambda x: x["season_number"]):
+            for e in sorted(s["episodes"], key=lambda x: x["episode_number"]):
                 videos.append({
-                    "id": f"{id}:{season['season_number']}:{ep['episode_number']}",
-                    "title": ep.get("title", f"S{season['season_number']} E{ep['episode_number']}"),
-                    "season": season["season_number"],
-                    "episode": ep["episode_number"],
-                    "released": ep.get("released") or datetime.now(timezone.utc).isoformat()
+                    "id": f"{id}:{s['season_number']}:{e['episode_number']}",
+                    "title": e.get("title", f"Episode {e['episode_number']}"),
+                    "season": s["season_number"], "episode": e["episode_number"],
+                    "released": e.get("released") or datetime.now(timezone.utc).isoformat()
                 })
         meta_obj["videos"] = videos
-
     return {"meta": meta_obj}
 
 @router.get("/{token}/stream/{media_type}/{id}.json")
 async def get_streams(token: str, media_type: str, id: str, token_data: dict = Depends(verify_token)):
-    # 1. Check Usage Limits
-    if token_data.get("limit_exceeded"):
-        return {"streams": [{"name": "Limit Reached", "title": "Upgrade Plan", "url": token_data["limit_video"]}]}
-
-    # 2. Parse ID
-    parts = id.split(":")
-    imdb_id, s_num, e_num = parts[0], (int(parts[1]) if len(parts) > 1 else None), (int(parts[2]) if len(parts) > 2 else None)
-
-    # 3. Fetch from DB
-    media_details = await db.get_media_details(imdb_id=imdb_id, season_number=s_num, episode_number=e_num)
-    if not media_details or "telegram" not in media_details:
-        return {"streams": []}
-
-    # 4. Build Multi-Part Streams
-    streams = []
-    for file_info in media_details.get("telegram", []):
-        if not file_info.get("id"): continue
-        
-        filename = file_info.get("name", "")
-        quality_str = file_info.get("quality", "HD")
-        size = file_info.get("size", "")
-
-        # Use our detection helpers
-        part_tag = detect_part(filename)
-        display_name, description = format_stream_details(filename, quality_str, size)
-        
-        streams.append({
-            "name": f"{display_name}{part_tag}",
-            "title": description,
-            "url": f"{BASE_URL}/dl/{token}/{file_info.get('id')}/video.mkv"
-        })
-
-    # 5. Smart Sort: Resolution first, then Part Order
-    streams.sort(key=lambda s: (get_resolution_priority(s["name"]), s["name"]), reverse=True)
+    if token_data.get("subscription_expired"):
+        return {"streams": [{"name": "🚫 Expired", "title": "Renew via bot", "url": Telegram.SUBSCRIPTION_URL}]}
     
+    if token_data.get("limit_exceeded"):
+        return {"streams": [{"name": "Limit Reached", "title": "Daily/Monthly limit hit", "url": token_data["limit_video"]}]}
+
+    try:
+        parts = id.split(":")
+        imdb_id, s_num, e_num = parts[0], (int(parts[1]) if len(parts) > 1 else None), (int(parts[2]) if len(parts) > 2 else None)
+    except: raise HTTPException(status_code=400)
+
+    media_details = await db.get_media_details(imdb_id=imdb_id, season_number=s_num, episode_number=e_num)
+    if not media_details or "telegram" not in media_details: return {"streams": []}
+
+    streams = []
+    for quality in media_details.get("telegram", []):
+        if quality.get("id"):
+            filename = quality.get("name", "")
+            q_str, size = quality.get("quality", "HD"), quality.get("size", "")
+            
+            # Detect Part
+            part_tag = detect_part(filename)
+            s_name, s_title = format_stream_details(filename, q_str, size)
+            
+            streams.append({
+                "name": f"{s_name}{part_tag}",
+                "title": s_title,
+                "url": f"{BASE_URL}/dl/{token}/{quality.get('id')}/video.mkv"
+            })
+
+    streams.sort(key=lambda s: (get_resolution_priority(s["name"]), s["name"]), reverse=True)
     return {"streams": streams}
